@@ -1,230 +1,184 @@
+#!/usr/bin/env python3
 """
-Transcript worker.
-
-Polls the Lovable backend for pending transcription jobs, downloads audio
-with yt-dlp, converts/normalizes with ffmpeg, transcribes with OpenAI
-Whisper, and posts segments back to the callback endpoint.
-
-All requests to the Lovable backend are signed with HMAC-SHA256 using
-TRANSCRIPT_WEBHOOK_SECRET, matching the server-side verification in
-src/routes/api/public/transcript-callback.ts and transcript-jobs.claim.ts.
+Transcript worker: polls the app for jobs, downloads audio via yt-dlp,
+transcribes with OpenAI Whisper, and reports results back.
 """
-
-from __future__ import annotations
-
-import hashlib
-import hmac
+import os
+import sys
+import time
 import json
 import logging
-import os
-import shutil
-import signal
-import subprocess
-import sys
 import tempfile
-import time
-from typing import Any
+import subprocess
+from pathlib import Path
 
 import requests
-from openai import OpenAI
 
-# ---------- Config ----------
-
-BASE_URL = os.environ["BASE_URL"].rstrip("/")
-WEBHOOK_SECRET = os.environ["TRANSCRIPT_WEBHOOK_SECRET"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-MAX_JOBS_PER_POLL = int(os.environ.get("MAX_JOBS_PER_POLL", "1"))
+# --- Config ---
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
+API_SECRET = os.environ.get("API_SECRET", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "60"))
-# Whisper hard limit is 25MB; downsample target keeps us well under.
-AUDIO_SAMPLE_RATE = os.environ.get("AUDIO_SAMPLE_RATE", "16000")
-AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "64k")
-
-CLAIM_URL = f"{BASE_URL}/api/public/transcript-jobs/claim"
-CALLBACK_URL = f"{BASE_URL}/api/public/transcript-callback"
 
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("worker")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-_shutdown = False
-
-
-def _handle_signal(signum, _frame):
-    global _shutdown
-    log.info("received signal %s, shutting down after current job", signum)
-    _shutdown = True
+if not APP_BASE_URL:
+    log.error("APP_BASE_URL is required")
+    sys.exit(1)
+if not OPENAI_API_KEY:
+    log.error("OPENAI_API_KEY is required")
+    sys.exit(1)
 
 
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
+def _auth_headers():
+    h = {"Content-Type": "application/json"}
+    if API_SECRET:
+        h["x-api-secret"] = API_SECRET
+    return h
 
 
-# ---------- HMAC helpers ----------
+def _write_cookies_file(tmpdir: str):
+    """Write YOUTUBE_COOKIES env var to a temp cookies.txt file. Returns path or None."""
+    if "YOUTUBE_COOKIES" not in os.environ:
+        log.info("YOUTUBE_COOKIES: not set")
+        return None
 
-def _sign(body: str) -> str:
-    return hmac.new(
-        WEBHOOK_SECRET.encode("utf-8"),
-        body.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    raw = os.environ.get("YOUTUBE_COOKIES", "")
+    log.info("YOUTUBE_COOKIES: set, length=%d", len(raw))
 
+    if not raw.strip():
+        log.warning("YOUTUBE_COOKIES is empty/whitespace; skipping cookies file")
+        return None
 
-def _post_signed(url: str, payload: dict[str, Any]) -> requests.Response:
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    headers = {
-        "Content-Type": "application/json",
-        "X-Webhook-Signature": _sign(body),
-    }
-    return requests.post(url, data=body, headers=headers, timeout=REQUEST_TIMEOUT)
-
-
-# ---------- Job pipeline ----------
-
-def claim_jobs() -> list[dict[str, Any]]:
-    res = _post_signed(CLAIM_URL, {"max": MAX_JOBS_PER_POLL})
-    res.raise_for_status()
-    return res.json().get("jobs", [])
+    path = os.path.join(tmpdir, "cookies.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raw)
+        size = os.path.getsize(path)
+        log.info("cookies.txt written: path=%s bytes=%d", path, size)
+        return path
+    except Exception as e:
+        log.error("Failed to write cookies.txt: %s", e)
+        return None
 
 
-def download_audio(video_url: str, workdir: str) -> str:
-    """Download bestaudio with yt-dlp into workdir; return file path."""
-    out_template = os.path.join(workdir, "src.%(ext)s")
+def claim_job():
+    url = f"{APP_BASE_URL}/api/public/transcript-jobs/claim"
+    try:
+        r = requests.post(url, headers=_auth_headers(), json={}, timeout=30)
+        if r.status_code == 204 or not r.text:
+            return None
+        r.raise_for_status()
+        data = r.json()
+        return data.get("job") or data
+    except Exception as e:
+        log.error("claim_job failed: %s", e)
+        return None
+
+
+def complete_job(job_id: str, transcript: str):
+    url = f"{APP_BASE_URL}/api/public/transcript-jobs/{job_id}/complete"
+    r = requests.post(url, headers=_auth_headers(), json={"transcript": transcript}, timeout=60)
+    r.raise_for_status()
+
+
+def fail_job(job_id: str, error: str):
+    url = f"{APP_BASE_URL}/api/public/transcript-jobs/{job_id}/fail"
+    try:
+        r = requests.post(url, headers=_auth_headers(), json={"error": error[:2000]}, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        log.error("fail_job request failed: %s", e)
+
+
+def download_audio(video_url: str, tmpdir: str) -> str:
+    out_template = os.path.join(tmpdir, "audio.%(ext)s")
+    cookies_path = _write_cookies_file(tmpdir)
+
     cmd = [
         "yt-dlp",
-        "-f", "bestaudio/best",
+        "-x",
+        "--audio-format", "mp3",
         "--no-playlist",
-        "--no-warnings",
         "-o", out_template,
-        video_url,
     ]
-    log.info("yt-dlp downloading %s", video_url)
-    subprocess.run(cmd, check=True, capture_output=True)
-    for name in os.listdir(workdir):
-        if name.startswith("src."):
-            return os.path.join(workdir, name)
+    if cookies_path:
+        cmd += ["--cookies", cookies_path]
+    cmd.append(video_url)
+
+    # Log command (path only, never cookie contents)
+    log.info("yt-dlp command: %s", " ".join(cmd))
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        log.error("yt-dlp failed (exit=%d)", proc.returncode)
+        log.error("yt-dlp stderr:\n%s", proc.stderr)
+        log.error("yt-dlp stdout:\n%s", proc.stdout)
+        raise RuntimeError(f"yt-dlp failed: {proc.stderr.strip()[:500]}")
+
+    # Find the produced file
+    for p in Path(tmpdir).iterdir():
+        if p.name.startswith("audio."):
+            return str(p)
     raise RuntimeError("yt-dlp produced no output file")
 
 
-def convert_audio(src_path: str, workdir: str) -> str:
-    """Convert to mono 16kHz mp3 for Whisper."""
-    out_path = os.path.join(workdir, "audio.mp3")
-    cmd = [
-        "ffmpeg", "-y", "-i", src_path,
-        "-vn",
-        "-ac", "1",
-        "-ar", AUDIO_SAMPLE_RATE,
-        "-b:a", AUDIO_BITRATE,
-        out_path,
-    ]
-    log.info("ffmpeg converting to mp3")
-    subprocess.run(cmd, check=True, capture_output=True)
-    return out_path
-
-
-def transcribe(audio_path: str) -> list[dict[str, Any]]:
-    """Call Whisper with verbose_json to get segments."""
-    log.info("whisper transcribing %s", audio_path)
+def transcribe(audio_path: str) -> str:
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     with open(audio_path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            model=WHISPER_MODEL,
-            file=f,
-            response_format="verbose_json",
-        )
-    segments_raw = getattr(result, "segments", None) or []
-    segments: list[dict[str, Any]] = []
-    for s in segments_raw:
-        text = (getattr(s, "text", "") or "").strip()
-        if not text:
-            continue
-        segments.append({
-            "text": text[:5000],
-            "start_time": float(getattr(s, "start", 0.0)),
-            "end_time": float(getattr(s, "end", 0.0)),
-        })
-    if not segments:
-        # Fallback: single segment with full text.
-        full = (getattr(result, "text", "") or "").strip()
-        if full:
-            segments.append({"text": full[:5000], "start_time": 0.0, "end_time": 0.0})
-    return segments
+        files = {"file": (os.path.basename(audio_path), f, "audio/mpeg")}
+        data = {"model": WHISPER_MODEL, "response_format": "text"}
+        r = requests.post(url, headers=headers, files=files, data=data, timeout=600)
+    if r.status_code != 200:
+        raise RuntimeError(f"Whisper API failed: {r.status_code} {r.text[:500]}")
+    return r.text.strip()
 
 
-def send_callback(video_id: str, status: str, *,
-                  segments: list[dict[str, Any]] | None = None,
-                  error: str | None = None) -> None:
-    payload: dict[str, Any] = {"video_id": video_id, "status": status}
-    if segments is not None:
-        payload["segments"] = segments
-    if error is not None:
-        payload["error"] = error[:2000]
-    res = _post_signed(CALLBACK_URL, payload)
-    if res.status_code >= 300:
-        log.error("callback %s failed: %s %s", status, res.status_code, res.text)
-        res.raise_for_status()
-    log.info("callback %s ok for %s", status, video_id)
+def process_job(job: dict):
+    job_id = job.get("id") or job.get("job_id")
+    video_url = job.get("video_url") or job.get("url")
+    if not job_id or not video_url:
+        log.error("Invalid job payload: %s", job)
+        return
 
-
-def process_job(job: dict[str, Any]) -> None:
-    video_id = job["video_id"]
-    video_url = job["video_url"]
-    log.info("processing job video_id=%s url=%s", video_id, video_url)
-    workdir = tempfile.mkdtemp(prefix="transcript-")
+    log.info("Processing job %s: %s", job_id, video_url)
     try:
-        src = download_audio(video_url, workdir)
-        audio = convert_audio(src, workdir)
-        segments = transcribe(audio)
-        if not segments:
-            send_callback(video_id, "failed", error="No transcript segments produced")
-            return
-        send_callback(video_id, "ready", segments=segments)
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or b"").decode("utf-8", "ignore")[-1500:]
-        log.exception("subprocess failed")
-        try:
-            send_callback(video_id, "failed", error=f"{e.cmd[0]} failed: {stderr}")
-        except Exception:
-            log.exception("failed to report failure")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = download_audio(video_url, tmpdir)
+            log.info("Downloaded audio: %s", audio_path)
+            transcript = transcribe(audio_path)
+            log.info("Transcribed %d chars", len(transcript))
+            complete_job(job_id, transcript)
+            log.info("Job %s completed", job_id)
     except Exception as e:
-        log.exception("job failed")
+        log.exception("Job %s failed", job_id)
+        fail_job(job_id, str(e))
+
+
+def main():
+    log.info("Worker starting. APP_BASE_URL=%s poll=%ss", APP_BASE_URL, POLL_INTERVAL)
+    log.info("YOUTUBE_COOKIES present: %s", "yes" if os.environ.get("YOUTUBE_COOKIES") else "no")
+    while True:
         try:
-            send_callback(video_id, "failed", error=str(e))
-        except Exception:
-            log.exception("failed to report failure")
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
-def main() -> int:
-    log.info("worker starting; base=%s poll=%ss", BASE_URL, POLL_INTERVAL)
-    while not _shutdown:
-        try:
-            jobs = claim_jobs()
-        except Exception:
-            log.exception("claim failed")
-            jobs = []
-
-        if not jobs:
-            for _ in range(POLL_INTERVAL):
-                if _shutdown:
-                    break
-                time.sleep(1)
-            continue
-
-        for job in jobs:
-            if _shutdown:
-                break
-            process_job(job)
-
-    log.info("worker stopped")
-    return 0
+            job = claim_job()
+            if job:
+                process_job(job)
+            else:
+                time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            log.info("Shutting down")
+            break
+        except Exception as e:
+            log.exception("Main loop error: %s", e)
+            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

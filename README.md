@@ -1,67 +1,62 @@
 # Transcript Worker
 
-External Python worker for the Lovable transcription pipeline.
+External worker that polls the Lovable app for transcript jobs, downloads audio with `yt-dlp`, transcribes via OpenAI Whisper, and posts results back.
 
-Polls the Lovable backend for pending transcription jobs, downloads audio
-with `yt-dlp`, converts it with `ffmpeg`, transcribes with OpenAI Whisper,
-and posts segments back to the callback endpoint. All requests are signed
-with HMAC-SHA256 using a shared secret.
+## Endpoints called
 
-## Endpoints used
-
-- `POST {BASE_URL}/api/public/transcript-jobs/claim` — atomically claim pending jobs.
-- `POST {BASE_URL}/api/public/transcript-callback` — report `ready` (with segments) or `failed`.
-
-Both require header `X-Webhook-Signature: hex(hmac_sha256(TRANSCRIPT_WEBHOOK_SECRET, raw_body))`.
+- `POST /api/public/transcript-jobs/claim`
+- `POST /api/public/transcript-jobs/:id/complete`
+- `POST /api/public/transcript-jobs/:id/fail`
 
 ## Environment variables
 
-| Name | Required | Default | Notes |
-|------|----------|---------|-------|
-| `BASE_URL` | yes | — | e.g. `https://project--<id>.lovable.app` |
-| `TRANSCRIPT_WEBHOOK_SECRET` | yes | — | Must match the value set in Lovable Cloud. |
-| `OPENAI_API_KEY` | yes | — | OpenAI key with Whisper access. |
-| `POLL_INTERVAL_SECONDS` | no | `30` | Sleep between empty polls. |
-| `MAX_JOBS_PER_POLL` | no | `1` | 1–5 (server-capped at 5). |
-| `WHISPER_MODEL` | no | `whisper-1` | |
-| `REQUEST_TIMEOUT_SECONDS` | no | `60` | HTTP timeout to Lovable backend. |
-| `AUDIO_SAMPLE_RATE` | no | `16000` | ffmpeg `-ar`. |
-| `AUDIO_BITRATE` | no | `64k` | ffmpeg `-b:a`. |
-| `LOG_LEVEL` | no | `INFO` | |
+| Var | Required | Description |
+|-----|----------|-------------|
+| `APP_BASE_URL` | yes | Base URL of the app, e.g. `https://your-app.lovable.app` |
+| `OPENAI_API_KEY` | yes | OpenAI key for Whisper |
+| `API_SECRET` | no | Shared secret sent as `x-api-secret` header |
+| `POLL_INTERVAL` | no | Seconds between polls (default `10`) |
+| `WHISPER_MODEL` | no | Default `whisper-1` |
+| `YOUTUBE_COOKIES` | no | Full Netscape cookies.txt contents (see below) |
+
+## YouTube cookies (Railway)
+
+YouTube increasingly blocks unauthenticated downloads. Provide a cookies file via env var:
+
+1. In your browser (logged into YouTube), export cookies using an extension like **Get cookies.txt LOCALLY** (Netscape format).
+2. Open the exported file and copy the **entire contents** (including the `# Netscape HTTP Cookie File` header line).
+3. In Railway → your service → **Variables** → **New Variable**:
+   - Name: `YOUTUBE_COOKIES`
+   - Value: paste the entire cookies.txt contents
+4. Redeploy.
+
+The worker writes the value to a temporary `cookies.txt` per job, passes it to yt-dlp via `--cookies`, and deletes it when the job ends. Cookies are never stored permanently and never logged.
+
+## Diagnostic logging
+
+On startup and per job, the worker logs:
+
+- Whether `YOUTUBE_COOKIES` is set and its length (not contents)
+- Whether `cookies.txt` was written, plus path and byte size
+- The full `yt-dlp` command line (cookie path only, never values)
+- On failure: full yt-dlp `stderr` and `stdout`
+
+Check Railway logs to confirm cookies are being applied.
 
 ## Local run
 
 ```bash
-cp .env.example .env   # fill in real values
-export $(grep -v '^#' .env | xargs)
+cp .env.example .env
+# fill in values
 pip install -r requirements.txt
-# requires ffmpeg installed locally
+export $(grep -v '^#' .env | xargs)
 python worker.py
 ```
 
 ## Deploy to Railway
 
-1. Push this directory to a GitHub repo.
-2. Create a new Railway project from the repo (Dockerfile is auto-detected).
-3. Add the env vars above under **Variables**.
-4. Deploy. The container runs `python worker.py` as a long-running worker
-   (no HTTP port is exposed).
-
-`railway.json` configures the Docker build and an automatic restart on
-failure (up to 10 retries).
-
-## Flow
-
-```
-loop:
-  POST /api/public/transcript-jobs/claim {"max": N}
-  for each job:
-    yt-dlp -f bestaudio  -> src.<ext>
-    ffmpeg -ac 1 -ar 16k -> audio.mp3
-    whisper verbose_json -> [{text, start_time, end_time}, ...]
-    POST /api/public/transcript-callback {video_id, status: "ready", segments}
-  if no jobs: sleep POLL_INTERVAL_SECONDS
-```
-
-On any failure the worker reports `status: "failed"` with an `error`
-string so the video doesn't stay stuck in `processing`.
+1. Push this folder to a GitHub repo.
+2. Railway → New Project → Deploy from GitHub → select repo.
+3. Railway auto-detects the `Dockerfile`.
+4. Add the env vars above under **Variables**.
+5. Deploy.
