@@ -1,0 +1,3 @@
+requests>=2.32.0
+openai>=1.51.0
+yt-dlp>=2024.10.7
