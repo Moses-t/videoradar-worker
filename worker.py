@@ -1,13 +1,21 @@
 """
 Transcript worker.
 
-Polls the Lovable backend for pending transcription jobs, downloads audio
-with yt-dlp, converts/normalizes with ffmpeg, transcribes with OpenAI
-Whisper, and posts segments back to the callback endpoint.
+Polls the Lovable backend for pending transcription jobs.
+
+Two download paths:
+- platform == "upload": video_url is a signed HTTPS URL to a file in
+  Supabase Storage. Download with plain HTTP GET (streamed).
+- Anything else (youtube, tiktok, instagram): use yt-dlp.
+
+Both paths then:
+- Extract/normalize audio with ffmpeg (mono 16kHz mp3)
+- Transcribe with OpenAI Whisper (verbose_json for segments)
+- POST segments back to the callback endpoint
 
 All requests to the Lovable backend are signed with HMAC-SHA256 using
-TRANSCRIPT_WEBHOOK_SECRET, matching the server-side verification in
-src/routes/api/public/transcript-callback.ts and transcript-jobs.claim.ts.
+TRANSCRIPT_WEBHOOK_SECRET (header X-Webhook-Signature) AND include a
+Bearer Authorization header carrying the same secret.
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -24,6 +33,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from openai import OpenAI
@@ -38,9 +48,10 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 MAX_JOBS_PER_POLL = int(os.environ.get("MAX_JOBS_PER_POLL", "1"))
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "60"))
-# Whisper hard limit is 25MB; downsample target keeps us well under.
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "600"))
 AUDIO_SAMPLE_RATE = os.environ.get("AUDIO_SAMPLE_RATE", "16000")
 AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "64k")
+MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
 
 CLAIM_URL = f"{BASE_URL}/api/public/transcript-jobs/claim"
 CALLBACK_URL = f"{BASE_URL}/api/public/transcript-callback"
@@ -66,7 +77,7 @@ signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 
-# ---------- HMAC helpers ----------
+# ---------- HMAC + auth helpers ----------
 
 def _sign(body: str) -> str:
     return hmac.new(
@@ -84,7 +95,6 @@ def _post_signed(url: str, payload: dict[str, Any]) -> requests.Response:
         "X-Webhook-Signature": _sign(body),
         "Authorization": f"Bearer {secret}",
     }
-    # Safe diagnostics: presence + length only, never the secret value.
     log.info(
         "outgoing request url=%s api_secret_present=%s api_secret_length=%d "
         "authorization_header_set=%s",
@@ -105,15 +115,9 @@ def claim_jobs() -> list[dict[str, Any]]:
 
 
 def _write_cookies_file(workdir: str) -> str | None:
-    """If YOUTUBE_COOKIES is set, write it to a temporary cookies.txt and return the path."""
     raw = os.environ.get("YOUTUBE_COOKIES")
-    if raw is None:
-        log.warning("YOUTUBE_COOKIES env var is NOT set; yt-dlp will run without cookies")
+    if raw is None or not raw.strip():
         return None
-    if not raw.strip():
-        log.warning("YOUTUBE_COOKIES is set but empty/whitespace (length=%d); skipping", len(raw))
-        return None
-    log.info("YOUTUBE_COOKIES present (length=%d chars)", len(raw))
     path = os.path.join(workdir, "cookies.txt")
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -121,15 +125,72 @@ def _write_cookies_file(workdir: str) -> str | None:
     except Exception:
         log.exception("failed to write cookies.txt")
         return None
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = -1
-    log.info("cookies.txt written: path=%s size=%d bytes", path, size)
     return path
 
 
-def download_audio(video_url: str, workdir: str) -> str:
+def _extension_from_response(resp: requests.Response, fallback_url: str) -> str:
+    """Best-effort guess at the right file extension for the downloaded blob."""
+    # 1. Content-Disposition filename
+    cd = resp.headers.get("Content-Disposition", "")
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+    if m:
+        name = m.group(1)
+        if "." in name:
+            return "." + name.rsplit(".", 1)[1].lower()
+    # 2. Path of URL (strip query string)
+    path = urlparse(fallback_url).path
+    if "." in path:
+        ext = path.rsplit(".", 1)[1].lower()
+        if 1 <= len(ext) <= 5:
+            return "." + ext
+    # 3. Content-Type
+    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    ctype_map = {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/x-matroska": ".mkv",
+        "video/mpeg": ".mpg",
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/webm": ".webm",
+    }
+    return ctype_map.get(ctype, ".bin")
+
+
+def download_direct(video_url: str, workdir: str) -> str:
+    """Stream the file at video_url to disk and return the local path.
+
+    Used for `platform=upload` jobs whose video_url is a signed Supabase
+    Storage HTTPS URL. The signed URL embeds its own auth token; no
+    Authorization header should be added.
+    """
+    log.info("direct download starting host=%s", urlparse(video_url).hostname)
+    with requests.get(video_url, stream=True, timeout=DOWNLOAD_TIMEOUT) as resp:
+        if not resp.ok:
+            raise RuntimeError(
+                f"direct download failed: HTTP {resp.status_code} {resp.reason}"
+            )
+        ext = _extension_from_response(resp, video_url)
+        out_path = os.path.join(workdir, f"src{ext}")
+        total = 0
+        with open(out_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError(
+                        f"download exceeded MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES})"
+                    )
+                fh.write(chunk)
+    log.info("direct download complete bytes=%d path=%s", total, out_path)
+    return out_path
+
+
+def download_ytdlp(video_url: str, workdir: str) -> str:
     """Download bestaudio with yt-dlp into workdir; return file path."""
     out_template = os.path.join(workdir, "src.%(ext)s")
     cmd = [
@@ -142,11 +203,7 @@ def download_audio(video_url: str, workdir: str) -> str:
     cookies_path = _write_cookies_file(workdir)
     if cookies_path:
         cmd += ["--cookies", cookies_path]
-        log.info("yt-dlp will use --cookies %s", cookies_path)
-    else:
-        log.info("yt-dlp running WITHOUT --cookies")
     cmd.append(video_url)
-    # Safe to log: only the cookies file path, never its contents.
     log.info("yt-dlp command: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True, capture_output=True)
@@ -162,6 +219,19 @@ def download_audio(video_url: str, workdir: str) -> str:
         if name.startswith("src."):
             return os.path.join(workdir, name)
     raise RuntimeError("yt-dlp produced no output file")
+
+
+def acquire_source(job: dict[str, Any], workdir: str) -> str:
+    """Route the job to the right downloader based on its platform."""
+    platform = (job.get("platform") or "").lower()
+    video_url = job["video_url"]
+    if platform == "upload":
+        if not video_url or not video_url.startswith(("http://", "https://")):
+            raise RuntimeError(
+                f"upload job missing signed HTTPS video_url (got: {video_url!r})"
+            )
+        return download_direct(video_url, workdir)
+    return download_ytdlp(video_url, workdir)
 
 
 def convert_audio(src_path: str, workdir: str) -> str:
@@ -181,7 +251,6 @@ def convert_audio(src_path: str, workdir: str) -> str:
 
 
 def transcribe(audio_path: str) -> list[dict[str, Any]]:
-    """Call Whisper with verbose_json to get segments."""
     log.info("whisper transcribing %s", audio_path)
     with open(audio_path, "rb") as f:
         result = client.audio.transcriptions.create(
@@ -201,7 +270,6 @@ def transcribe(audio_path: str) -> list[dict[str, Any]]:
             "end_time": float(getattr(s, "end", 0.0)),
         })
     if not segments:
-        # Fallback: single segment with full text.
         full = (getattr(result, "text", "") or "").strip()
         if full:
             segments.append({"text": full[:5000], "start_time": 0.0, "end_time": 0.0})
@@ -225,11 +293,11 @@ def send_callback(video_id: str, status: str, *,
 
 def process_job(job: dict[str, Any]) -> None:
     video_id = job["video_id"]
-    video_url = job["video_url"]
-    log.info("processing job video_id=%s url=%s", video_id, video_url)
+    platform = job.get("platform", "?")
+    log.info("processing job video_id=%s platform=%s", video_id, platform)
     workdir = tempfile.mkdtemp(prefix="transcript-")
     try:
-        src = download_audio(video_url, workdir)
+        src = acquire_source(job, workdir)
         audio = convert_audio(src, workdir)
         segments = transcribe(audio)
         if not segments:
